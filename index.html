@@ -1078,10 +1078,11 @@
 
 <script>
 /* ══════════════════════════════════════════════════════════════
-   생기부 돋보기 — 전 과정이 이 브라우저 안에서 실행된다.
+   학년 세특 돋보기 — 전 과정이 이 브라우저 안에서 실행된다.
    서버 호출(google.script.run, fetch, XHR) 은 어디에도 없다.
-   유일한 외부 요청은 .xlsx 를 올렸을 때 해석 라이브러리를 내려받는
-   것뿐이며, 그때도 파일 내용은 전송되지 않는다.
+   xlsx 도 여기서 직접 푼다(1.6절). 바깥으로 나가는 요청은 없다 —
+   압축 풀기가 없는 옛 브라우저에서만 해석 라이브러리를 한 번 빌려 오고,
+   그때도 파일 내용은 전송되지 않는다.
    ══════════════════════════════════════════════════════════════ */
 
 const $ = s => document.querySelector(s);
@@ -1644,8 +1645,161 @@ function flattenNeisPaged(grid){
   return out;
 }
 
+/* ─── 1.6 엑셀을 직접 읽기 ──────────────────────────────────
+   xlsx 는 XML 몇 장을 zip 으로 묶은 것이다. 예전에는 브라우저가 그 압축을 풀 줄
+   몰라서, .xlsx 를 올릴 때마다 해석 라이브러리를 바깥에서 내려받았다. 그런데
+   학교 네트워크가 그 요청을 막으면 반별 파일을 한 개도 못 열고, 여덟 개를 일일이
+   csv 로 저장해야 했다. 실제로 자료는 나가지 않는데도 '인터넷이 필요한 도구' 로
+   보이는 것도 이 하나 때문이었다.
+
+   요즘 브라우저에는 압축을 푸는 기능이 들어 있다(DecompressionStream). 그래서
+   이제 바깥에 **아무것도 요청하지 않고** 여기서 직접 읽는다.
+   그 기능이 없는 옛 브라우저에서만 예전 길로 되돌아간다. */
+
+const XML_ENT = { amp:'&', lt:'<', gt:'>', quot:'"', apos:"'" };
+const unescXml = s => String(s).replace(/&(#x?[0-9a-fA-F]+|amp|lt|gt|quot|apos);/g, (m, g) =>
+  g[0] !== '#' ? XML_ENT[g]
+               : String.fromCodePoint(g[1] === 'x' ? parseInt(g.slice(2), 16) : +g.slice(1)));
+
+async function inflateRaw(bytes){
+  const st = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('deflate-raw'));
+  return new Uint8Array(await new Response(st).arrayBuffer());
+}
+
+/* zip 을 연다. 크기·자리는 가운데 목록(central directory)에서 읽되, 자료가 실제로
+   놓인 자리는 각 조각의 머리에서 다시 잰다 — 둘의 이름·여분 길이가 다를 수 있다. */
+async function unzipHere(buf){
+  const b = new DataView(buf), u = new Uint8Array(buf);
+  let eo = -1;
+  for (let i = u.length - 22; i >= 0 && i > u.length - 66000; i--)
+    if (b.getUint32(i, true) === 0x06054b50){ eo = i; break; }
+  if (eo < 0) throw new Error('zip 이 아닙니다');
+
+  const count = b.getUint16(eo + 10, true);
+  let p = b.getUint32(eo + 16, true);
+  const dec = new TextDecoder('utf-8');
+  const files = {};
+  for (let n = 0; n < count; n++){
+    if (p + 46 > u.length || b.getUint32(p, true) !== 0x02014b50) break;
+    const method  = b.getUint16(p + 10, true);
+    const csize   = b.getUint32(p + 20, true);
+    const nameLen = b.getUint16(p + 28, true);
+    const extLen  = b.getUint16(p + 30, true);
+    const cmtLen  = b.getUint16(p + 32, true);
+    const lho     = b.getUint32(p + 42, true);
+    const name    = dec.decode(u.subarray(p + 46, p + 46 + nameLen));
+    p += 46 + nameLen + extLen + cmtLen;
+    if (!/\.(xml|rels)$/i.test(name)) continue;          // 그림·글꼴 따위는 풀 것 없다
+    const lNameLen = b.getUint16(lho + 26, true);
+    const lExtLen  = b.getUint16(lho + 28, true);
+    const at = lho + 30 + lNameLen + lExtLen;
+    const raw = u.subarray(at, at + csize);
+    files[name] = method === 8 ? await inflateRaw(raw) : raw.slice();
+  }
+  return files;
+}
+
+const xmlOf = x => x ? new TextDecoder('utf-8').decode(x) : '';
+
+/* 되풀이되는 글자는 따로 모아 두고 칸에서는 번호로만 가리킨다 */
+function sharedStrings(xml){
+  const out = [];
+  if (!xml) return out;
+  const re = /<si>([\s\S]*?)<\/si>/g;
+  let m;
+  while ((m = re.exec(xml))){
+    // 후리가나(rPh)는 본문이 아니다
+    const body = m[1].replace(/<rPh[\s\S]*?<\/rPh>/g, '');
+    const tre = /<t[^>]*>([\s\S]*?)<\/t>/g;
+    let t = '', tm;
+    while ((tm = tre.exec(body))) t += tm[1];
+    out.push(unescXml(t));
+  }
+  return out;
+}
+
+const colOfRef = ref => {
+  let n = 0;
+  for (let i = 0; i < ref.length; i++){
+    const c = ref.charCodeAt(i);
+    if (c < 65 || c > 90) break;
+    n = n * 26 + (c - 64);
+  }
+  return n - 1;
+};
+
+/* 빈 칸은 <c .../> 로 닫히고 빈 줄은 <row .../> 로 닫힌다. 닫는 표를 함께 보지 않으면
+   다음 칸·다음 줄까지 통째로 삼켜 세특이 사라진다. */
+function sheetRows(xml, ss){
+  const rows = [];
+  const rre = /<row(?:[^>"]|"[^"]*")*?(?:\/>|>([\s\S]*?)<\/row>)/g;
+  let rm;
+  while ((rm = rre.exec(xml))){
+    const body = rm[1];
+    if (!body) continue;
+    const cells = [];
+    const cre = /<c r="([A-Z]+)\d+"((?:[^>"]|"[^"]*")*?)(?:\/>|>([\s\S]*?)<\/c>)/g;
+    let cm;
+    while ((cm = cre.exec(body))){
+      const attrs = cm[2] || '', inner = cm[3] || '';
+      const t = (attrs.match(/t="([^"]+)"/) || [])[1];
+      let v = '';
+      if (t === 's'){
+        const i = (inner.match(/<v>(\d+)<\/v>/) || [])[1];
+        v = i != null ? (ss[+i] || '') : '';
+      } else if (t === 'inlineStr'){
+        const im = inner.replace(/<rPh[\s\S]*?<\/rPh>/g, '').match(/<t[^>]*>([\s\S]*?)<\/t>/);
+        v = im ? unescXml(im[1]) : '';
+      } else {
+        const vm = inner.match(/<v>([\s\S]*?)<\/v>/);
+        v = vm ? unescXml(vm[1]) : '';
+      }
+      const at = colOfRef(cm[1]);
+      if (at < 0) continue;
+      while (cells.length < at) cells.push('');
+      cells[at] = v;
+    }
+    if (cells.some(c => c !== '')) rows.push(cells);
+  }
+  return rows;
+}
+
+/* 통합 문서가 첫째로 가리키는 시트를 고른다. 못 찾으면 sheet1 을 쓴다. */
+function firstSheetXml(files){
+  const wb = xmlOf(files['xl/workbook.xml']);
+  const rels = xmlOf(files['xl/_rels/workbook.xml.rels']);
+  const m = wb.match(/<sheet[^>]*r:id="([^"]+)"/);
+  if (m && rels){
+    const rm = rels.match(new RegExp('<Relationship[^>]*Id="' + m[1] + '"[^>]*Target="([^"]+)"'));
+    if (rm){
+      const key = 'xl/' + rm[1].replace(/^\/?xl\//, '').replace(/^\//, '');
+      if (files[key]) return files[key];
+    }
+  }
+  const k = Object.keys(files).find(x => /^xl\/worksheets\/sheet\d+\.xml$/.test(x));
+  return k ? files[k] : null;
+}
+
+async function readXlsxHere(buf){
+  if (typeof DecompressionStream === 'undefined')
+    throw new Error('이 브라우저는 압축을 직접 풀지 못합니다');
+  const files = await unzipHere(buf);
+  const sheet = firstSheetXml(files);
+  if (!sheet) throw new Error('시트를 찾지 못했습니다');
+  const rows = sheetRows(xmlOf(sheet), sharedStrings(xmlOf(files['xl/sharedStrings.xml'])));
+  if (rows.length < 2) throw new Error('읽은 줄이 너무 적습니다');
+  return rows;
+}
+
 let xlsxReady = null;
 function parseXlsx(buf){
+  /* 여기서 직접 읽는 것이 기본이다. 바깥에 아무것도 요청하지 않는다.
+     압축 풀기가 없는 옛 브라우저이거나 낯선 xlsx 라서 실패하면,
+     그때만 예전처럼 해석 라이브러리를 빌려 온다. */
+  return readXlsxHere(buf).catch(() => parseXlsxByLib(buf));
+}
+
+function parseXlsxByLib(buf){
   if (!xlsxReady){
     xlsxReady = new Promise((res, rej) => {
       const s = document.createElement('script');
