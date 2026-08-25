@@ -2053,6 +2053,97 @@ function charSpans(doc, idx, N, self, minOthers){
                    (k, j) => doc.slice(k, j));
 }
 
+/* ── 잘게 갈린 '그대로' 구간 되살리기 ────────────────────────
+   pickSpans 는 자리마다 **가장 큰 무리**를 골라 붙이고, 무리가 바뀌는 지점에서
+   구간을 자른다. 도입부처럼 한 무리가 통째로 나눠 쓴 자리는 그래서 깔끔하게
+   한 덩이로 남는다 — 그 성질은 공통 활동을 가려내는 데 꼭 필요하다.
+
+   그런데 토씨까지 같은 문장이라도 어절마다 '함께 쓴 인원' 은 들쭉날쭉하다.
+   「법적 쟁점을 정확히 / 파악하고 / 판례를 비교 / 분석하여」 가 17명·7명·54명·7명
+   으로 갈리는 식이다. 그러면 41자가 1~9자짜리 열 조각으로 잘리고, 조각마다
+   최소 구간 길이에 못 미쳐 **전부 버려진다.** 고유명사를 지운 골격(B)은 인원이
+   고르게 남아 살아남으므로, 글자 그대로 베낀 자리가 하늘색으로만 보이게 된다.
+
+   그래서 **짧은 조각만 이어진 자리**는 다시 한 덩이로 놓고, 거기서 실제로
+   글자 그대로 이어지는 가장 긴 구간을 찾아 되살린다.
+   길이가 이미 충분한 조각은 손대지 않는다 — 큰 무리를 고르는 성질을 지키기 위해서다. */
+
+/* p 자리에서 다른 문서와 글자 그대로 이어지는 길이를 재어,
+   'minOthers 명 이상이 함께 가진 가장 긴 길이' 와 그 사람들을 돌려준다. */
+function exactRun(doc, docs, cand, self, p, limit, N, minOthers){
+  const lens = [];
+  const g = doc.substr(p, N);
+  for (const v of cand){
+    if (v === self) continue;
+    const d2 = docs[v];
+    let best = 0, at = d2.indexOf(g);
+    while (at >= 0){
+      let L = 0;
+      while (L < limit && at + L < d2.length && doc.charCodeAt(p + L) === d2.charCodeAt(at + L)) L++;
+      if (L > best) best = L;
+      if (best >= limit) break;
+      at = d2.indexOf(g, at + 1);
+    }
+    if (best >= N) lens.push({ v, L: best });
+  }
+  if (lens.length < minOthers) return null;
+  lens.sort((a, b) => b.L - a.L);
+  const L = lens[minOthers - 1].L;
+  const set = new Set([self]);
+  for (const e of lens) if (e.L >= L) set.add(e.v);
+  return { L, set };
+}
+
+function reviveExact(doc, docs, idx, N, self, minOthers, minSpan, pieces){
+  const short = s => s.end - s.start < minSpan;
+  const out = [];
+  let i = 0;
+  while (i < pieces.length){
+    if (!short(pieces[i])){ out.push(pieces[i]); i++; continue; }
+
+    /* 짧은 조각이 맞붙어 이어진 자리를 통째로 다시 본다.
+       여럿이 함께 쓴 짧은 상투구가 그 안에 끼어 있어도 갈라 세우지 않는다 —
+       연결부까지 토씨가 같다면 그건 활동명이 겹친 게 아니라 문장을 베낀 것이다.
+       진짜 활동명이라면 조절판의 [활동명 직접 적기] 가 그 자리만 도려낸다. */
+    let j = i, end = pieces[i].end;
+    while (j + 1 < pieces.length && pieces[j+1].start === end &&
+           short(pieces[j+1])){ j++; end = pieces[j].end; }
+
+    let p = pieces[i].start;
+    while (p + N <= end){
+      const cand = idx.get(doc.substr(p, N));
+      if (!cand || cand.size < 2){ p++; continue; }
+      const r = exactRun(doc, docs, cand, self, p, end - p, N, minOthers);
+      if (!r){ p++; continue; }
+      /* 짧게 겹친 곳은 되살리지 않는다 — 「침묵의 봄」을 읽고 처럼 누구나 쓰는
+         말이라, 옆에 걸린 구간이 있다고 해서 함께 살리면 확인 대상이 폭발한다. */
+      if (r.L >= minSpan)
+        out.push({ start:p, end:p + r.L, n:r.set.size - 1,
+                   text:doc.slice(p, p + r.L), set:r.set });
+      p += r.L;
+    }
+    i = j + 1;
+  }
+  return joinTouching(doc, out);
+}
+
+/* 맞붙은 데다 나눠 쓴 사람까지 똑같은 구간은 한 덩이로 합친다.
+   갈라 두면 같은 베낌 하나에 꼬리표가 두세 개 붙어 읽기만 어려워진다. */
+function joinTouching(doc, spans){
+  const out = [];
+  for (const sp of spans){
+    const last = out[out.length - 1];
+    if (last && last.end === sp.start && last.set.size === sp.set.size &&
+        [...sp.set].every(v => last.set.has(v))){
+      last.end = sp.end;
+      last.text = doc.slice(last.start, last.end);
+      continue;
+    }
+    out.push(sp);
+  }
+  return out;
+}
+
 /* 어절 문서빈도 — 고유명사를 형태소 분석 없이 근사하는 데 쓴다.
    그 학생만 쓴 어절이 곧 그 학생 고유의 것이다. */
 function buildWordDf(wordsPerDoc){
@@ -2264,11 +2355,14 @@ function analyze(rows, o){
     s.set.forEach(v => { if (clsOf[v]) seen.add(clsOf[v]); });
     return seen.size;
   };
+  /* 공통 활동 판정. 아래 per 계산과 '그대로' 되살리기가 같은 잣대를 써야 해서
+     여기 한 곳에만 둔다. */
+  const isCommon = s => (s.n + 1) >= commonN && (nCls < 2 || spreadOf(s) >= 2);
 
   const per = docs.map((d, i) => {
     // 최소 구간 길이에 못 미치는 조각은 버린다 — 전문용어 하나로 걸리는 것을 막는다
-    const rawA = charSpans(d, charIdx, o.charN, i, o.minOthers)
-                   .filter(s => s.end - s.start >= o.minSpan);
+    const rawA = reviveExact(d, docs, charIdx, o.charN, i, o.minOthers, o.minSpan,
+                             charSpans(d, charIdx, o.charN, i, o.minOthers));
     const rawB = skelSpans(skels[i], wordsPerDoc[i], skelIdx, o.wordK, i, o.minOthers)
                    .filter(s => s.end - s.start >= o.minSpan);
 
@@ -2291,7 +2385,6 @@ function analyze(rows, o){
        진짜 공통 활동은 여러 반에 걸쳐 있고, 돌려쓰기는 한 반에 뭉쳐 있다.
        한 반에 몰린 것은 확인 대상으로 남기고, 활동명이면 직접 적어 빼면 된다.
        반이 하나뿐이거나 반 정보가 없으면 이 판단을 할 수 없으니 인원만 본다. */
-    const isCommon = s => (s.n + 1) >= commonN && (nCls < 2 || spreadOf(s) >= 2);
     const common = A.dec.concat(B.dec, A.flag.filter(isCommon), B.flag.filter(isCommon));
     const a = A.flag.filter(s => !isCommon(s));
     const b = B.flag.filter(s => !isCommon(s));
