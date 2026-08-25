@@ -7,7 +7,9 @@ const path = require('path');
 const lib = require('./_lib.js');
 const analyze = lib.algo().analyze;
 const base = lib.defaults();
-const rows = lib.sampleRows();
+/* 겹침은 과목마다 따로 잰다. 두 과목을 한 솥에 넣고 재면 서로 걸려
+   헛짚음이 부풀어 오르므로, 정답을 아는 「대수」 묶음만 본다. */
+const rows = lib.sampleRows('대수');
 
 const at = (c, n) => rows.findIndex(r => r.cls === String(c) && r.no === String(n));
 const PLANTED = new Set([at(1,5), at(1,11),                       // 그대로 베낀 둘
@@ -70,29 +72,55 @@ for (const c of [2, 3, 4, 5, 6, 7]){
 }
 
 /* 실제 기록에서 짧은 겹침이 얼마나 흔한지 — 최소 구간 길이의 근거 */
-const file = process.argv[2];
-if (file){
+const files = process.argv.slice(2);
+if (files.length){
   const rx = require('./_readxlsx.js');
-  const g = rx.read(file);
-  const head = g[0].map(h => String(h).replace(/_x000D_/g,'').replace(/\s/g,''));
-  const ct = head.findIndex(h => h.indexOf('세부능력') >= 0 || h.indexOf('특기사항') >= 0);
-  const ci = head.indexOf('반/번호');
+  const { flattenNeisPaged } = lib.paged();
+  /* 파일은 반별 인쇄 양식일 수도, 예전 업로드 양식일 수도 있다. 둘 다 받는다. */
   const real = [];
-  for (let i = 1; i < g.length; i++){
-    const t = String(g[i][ct] ?? '').trim();
-    if (t.length < 10) continue;
-    const [cls, no] = String(g[i][ci] ?? ('/' + i)).split('/');
-    real.push({ cls, no, label:`${cls}반 ${no}번`, text:t });
+  for (const file of files){
+    const g0 = rx.read(file);
+    const flat = flattenNeisPaged(g0);
+    if (flat){
+      flat.slice(1).forEach(r => real.push({ cls:r[0], no:r[1], subj:r[3],
+        label:`${r[0]}반 ${r[1]}번`, text:r[6] }));
+      continue;
+    }
+    const head2 = g0[0].map(h => String(h).replace(/_x000D_/g,'').replace(/\s/g,''));
+    const ct = head2.findIndex(h => h.indexOf('세부능력') >= 0 || h.indexOf('특기사항') >= 0);
+    const ci = head2.indexOf('반/번호');
+    const cs = head2.indexOf('과목');
+    for (let i = 1; i < g0.length; i++){
+      const t = String(g0[i][ct] == null ? '' : g0[i][ct]).trim();
+      if (t.length < 10) continue;
+      const [cls, no] = String(g0[i][ci] == null ? ('/' + i) : g0[i][ci]).split('/');
+      real.push({ cls, no, subj: cs >= 0 ? String(g0[i][cs] || '') : '',
+                  label:`${cls}반 ${no}번`, text:t });
+    }
   }
-  console.log(`\n■ 실제 기록 ${real.length}명 — 최소 구간 길이를 올리면 확인 대상이 어떻게 주나\n`);
-  console.log('  길이   확인 대상   가장 긴 겹침   공통으로 빠진 표현');
-  for (const sp of SPANS){
-    const r = analyze(real, Object.assign({}, base, { minSpan:sp, declared:[] }));
-    const flag = r.per.filter(p => p.a.length || p.b.length).length;
-    const longest = Math.max(0, ...r.per.flatMap(p => p.a.concat(p.b).map(s => s.end - s.start)));
-    console.log(`  ${String(sp+'자').padStart(5)}   ${String(flag+'명').padStart(7)}` +
-                `   ${String(longest+'자').padStart(9)}   ${r.phraseC.length}개`);
+
+  /* 화면과 같게 **과목마다 따로** 재고 합친다 */
+  const bySubj = new Map();
+  real.forEach(r => { const k = r.subj || '(과목 미상)';
+    if (!bySubj.has(k)) bySubj.set(k, []); bySubj.get(k).push(r); });
+
+  console.log(`\n■ 실제 기록 ${real.length}건 · 과목 ${bySubj.size}개 — 최소 구간 길이를 바꾸면 어떻게 되나\n`);
+  console.log('  길이    확인 대상        평균 생존   같은 반 겹침   공통으로 빠진 표현');
+  for (const sp of [12, 16, 18, 20, 22, 24, 28]){
+    const o = Object.assign({}, base, { minSpan:sp, declared:[] });
+    let flag = 0, same = 0, alive = 0, n = 0, common = 0;
+    for (const [, sub] of bySubj){
+      if (sub.length < 2){ n += sub.length; alive += sub.length; continue; }
+      const r = analyze(sub, o);
+      r.per.forEach(p => { n++; alive += p.alive;
+        if (p.a.length || p.b.length) flag++;
+        if (p.sameCls) same++; });
+      common += r.phraseC.length;
+    }
+    console.log(`  ${String(sp+'자').padStart(5)}   ${String(flag+'건').padStart(7)} (${String(Math.round(flag/n*100)+'%').padStart(4)})` +
+                `   ${String((alive/n*100).toFixed(1)+'%').padStart(9)}   ${String(same+'건').padStart(9)}` +
+                `   ${String(common+'개').padStart(10)}`);
   }
 } else {
-  console.log('\n(실제 파일 경로를 주면 진짜 기록에서도 재 봅니다)');
+  console.log('\n(실제 파일 경로를 주면 진짜 기록에서도 재 봅니다 — 여러 개를 한꺼번에 주셔도 됩니다)');
 }
